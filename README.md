@@ -85,22 +85,26 @@ AWS X-Ray のサービスマップ／トレース詳細で可視化できるよ�
 
 ```
 [Client]
-   │  (HTTP)
-   ▼
-[ALB]                       ← X-Amzn-Trace-Id を採番／伝播
-   │  (HTTP, X-Amzn-Trace-Id)
-   ▼
-┌─ ECS Fargate Task ──────────────────────────────┐
-│  ┌──────────────┐  OTLP/HTTP   ┌──────────────┐ │
-│  │  api (FastAPI)│ ───────────▶│ otel-collector│ │
-│  │  自動計装:    │  :4318       │ (ADOT sidecar)│ │
-│  │   - FastAPI   │              └──────┬───────┘ │
-│  │   - botocore  │                     │         │
-│  └──────┬────────┘                     │         │
-└─────────┼──────────────────────────────┼─────────┘
-          │ DynamoDB API                 │ awsxray exporter
-          ▼                              ▼
-     [DynamoDB]                     [AWS X-Ray]
+    │ HTTP
+    ▼
+[ALB] ─── X-Amzn-Trace-Id 採番／伝播
+    │
+    ▼
+┌─ ECS Fargate Task ──────────────────────────────────────┐
+│   ┌──────────────────┐  OTLP/HTTP  ┌──────────────────┐ │
+│   │ api (FastAPI)    │ ──────────▶ │ otel-collector   │ │
+│   │ 自動計装:         │   :4318      │ (ADOT sidecar)   │ │
+│   │  • FastAPI       │              │                  │ │
+│   │  • botocore      │              └────────┬─────────┘ │
+│   │  • httpx         │                       │ awsxray   │
+│   └──┬─────────┬─────┘                       │ exporter  │
+└──────┼─────────┼─────────────────────────────┼───────────┘
+       │ AWS API │ HTTPS                       │
+       │ (boto3) │ (httpx)                     ▼
+       ▼         ▼                       [AWS X-Ray]
+   [DynamoDB]  [NAT GW] ──▶ Internet ──▶ [外部 API]
+   (Gateway                              (例: api.ipify.org)
+    VPCE)
 ```
 
 ### 構成要素
@@ -138,7 +142,10 @@ AWS X-Ray のサービスマップ／トレース詳細で可視化できるよ�
 3. `id_generator=AwsXRayIdGenerator()` を持つ `TracerProvider` を構築
 4. `OTEL_EXPORTER_OTLP_ENDPOINT` が設定されていれば OTLP/HTTP の `BatchSpanProcessor` を装着
    （ローカル開発時は未設定にしておけば送信処理ごと無効化される）
-5. `FastAPIInstrumentor.instrument_app(app)` と `BotocoreInstrumentor().instrument()` で自動計装
+5. 自動計装を 3 種有効化
+   - `FastAPIInstrumentor.instrument_app(app)` … 受信リクエスト
+   - `BotocoreInstrumentor().instrument()` … boto3 が呼ぶ AWS API（DynamoDB 等）
+   - `HTTPXClientInstrumentor().instrument()` … `httpx` 経由の外部 HTTP 呼び出し
 
 ECS 側で渡している環境変数（タスク定義より）：
 
@@ -190,6 +197,66 @@ ALB のターゲットヘルスチェックは秒〜数十秒間隔で `/health`
 `setup_tracing(app, ..., drop_successful_paths=("/health", "/ping"))` のように
 呼び出し側で渡せる。
 
+### 外部 HTTP 呼び出しの計装（httpx）
+
+`opentelemetry-instrumentation-httpx` を `setup_tracing()` 内で有効化しているため、
+**`httpx.Client` / `httpx.AsyncClient` から発行される全ての HTTP リクエストが
+自動的にクライアントスパン化される**。アプリケーション側のコードに変更は不要で、
+`async with httpx.AsyncClient() as client: await client.get(...)` のような通常の
+書き方でそのまま観測できる。
+
+#### スパンの中身
+
+| 観点 | 内容 |
+| --- | --- |
+| Span Kind | `CLIENT` |
+| Span 名 | HTTP メソッド名（`GET` / `POST` …） |
+| 主な属性 | `http.url`, `http.method`, `http.status_code`, `server.address`, `server.port` |
+| 親スパン | 同リクエスト内で生成された `SERVER` スパン（例: `GET /configuration`） |
+| サービスマップ | 接続先ホスト名（`api.ipify.org` 等）が外部ノードとして可視化 |
+
+#### トレースコンテキストの伝播
+
+`AwsXRayPropagator` をグローバルプロパゲーターに設定しているため、httpx で
+発行する**外部リクエストのヘッダにも `X-Amzn-Trace-Id` が自動で付与される**。
+ipify のような汎用 API 側はこのヘッダを使わないが、相手側も
+OpenTelemetry/X-Ray で計装されているマイクロサービスであれば、
+**追加実装なしで分散トレーシングが連結する**（`/configuration` ⇆ 別の社内 API
+というパターンに発展させる場合も、本サンプルの構成のまま動作する）。
+
+#### サンプル：`GET /configuration`
+
+`app/api/configuration.py` で `httpx.AsyncClient` から `https://api.ipify.org`
+を呼び出して結果を返すだけの薄いエンドポイント。機能的な意味は薄く、
+**httpx 計装の動作確認専用**として用意している。
+
+```bash
+curl "http://${ALB_DNS}/configuration"
+# => {"service_name":"py-apm-sample","environment":"prod","outbound_ip":"<NAT GW の EIP>"}
+```
+
+X-Ray 上で見えるべきもの：
+
+- **トレース詳細**: ルートの `GET /configuration`（SERVER スパン）配下に、
+  `GET`（CLIENT スパン、`http.url=https://api.ipify.org/?format=json`）が 1 本
+  ぶら下がる。HTTP ステータスや接続先ホストも属性として記録されている。
+- **サービスマップ**: `py-apm-sample-api → api.ipify.org` のエッジが追加される。
+  外部 API がレイテンシスパイク／エラーになるとこのエッジ上で可視化される。
+- **副次効果**: レスポンスの `outbound_ip` は NAT Gateway に紐付いた Elastic IP と
+  一致するので、**Private Subnet → NAT → Internet** の経路まで合わせて検証できる。
+
+#### 別の HTTP クライアントを使いたい場合
+
+| ライブラリ | 必要な計装パッケージ |
+| --- | --- |
+| `httpx`（採用中） | `opentelemetry-instrumentation-httpx` |
+| `requests` | `opentelemetry-instrumentation-requests` |
+| `urllib`/`urllib3` | `opentelemetry-instrumentation-urllib` / `-urllib3` |
+| `aiohttp` クライアント | `opentelemetry-instrumentation-aiohttp-client` |
+
+いずれも `setup_tracing()` 内で `XxxInstrumentor().instrument()` を 1 行追加する
+だけで計装できる。
+
 ### 動作確認
 
 デプロイ後、いくつかリクエストを投げてから X-Ray コンソールを開く：
@@ -206,18 +273,8 @@ curl "http://${ALB_DNS}/users/alice@example.com"
 - ALB 自体は X-Ray に独立スパンを発行しないが、ALB が採番した `X-Amzn-Trace-Id` を
   アプリ側で親として継承するため、トレース ID は ALB から DynamoDB まで一貫する。
 
-外部 HTTP 呼び出しのトレースが乗っていることは `/configuration` で確認できる：
-
-```bash
-curl "http://${ALB_DNS}/configuration"
-# => {"service_name":"...","environment":"prod","outbound_ip":"<NAT GW の EIP>"}
-```
-
-このリクエストでは `GET /configuration` のサーバースパン配下に
-`GET https://api.ipify.org` の HTTP クライアントスパンが付き、X-Ray のサービスマップに
-`api.ipify.org`（外部 HTTP）ノードが追加される。`outbound_ip` の値が NAT Gateway に
-紐付いた EIP と一致することで、Private Subnet → NAT → Internet の経路も
-合わせて検証できる。
+外部 HTTP 呼び出しが計装されていることの確認は前述の
+[外部 HTTP 呼び出しの計装（httpx）](#外部-http-呼び出しの計装httpx) を参照。
 
 ### 既知のはまりどころ
 
@@ -227,6 +284,10 @@ curl "http://${ALB_DNS}/configuration"
   `dependsOn: START` を必ず指定する（再起動時のレース対策）。
 - ローカル実行（`uv run uvicorn ...`）では `OTEL_EXPORTER_OTLP_ENDPOINT` を未設定にしておけば
   Collector への接続を試みず、自動計装のオーバーヘッドだけが乗る状態で開発できる。
+- httpx 計装は `HTTPXClientInstrumentor().instrument()` を呼んだ時点でグローバルに
+  パッチが当たる。既に生成済みの `Client` インスタンスにも反映されるが、計装前から
+  保持していた接続のリクエストではコンテキストが伝播しないので、`setup_tracing()` は
+  必ず最初に呼ぶこと。
 
 ## クリーンアップ
 
