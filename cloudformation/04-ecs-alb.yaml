@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ECS Fargate service fronted by an Application Load Balancer (no auth).
+  Cost-optimized with the smallest CPU/Memory combination (256 / 512).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: py-apm-sample
+  ImageUri:
+    Type: String
+    Description: ECR image URI including tag (e.g. 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/py-apm-sample/api:latest)
+  ContainerPort:
+    Type: Number
+    Default: 8000
+  DesiredCount:
+    Type: Number
+    Default: 1
+  UsersTableName:
+    Type: String
+    Default: users
+  AdotCollectorImage:
+    Type: String
+    # ADOT (AWS Distro for OpenTelemetry) Collector の公式 ECR Public イメージ。
+    # 本番運用時はタグを固定するのが望ましい。
+    Default: public.ecr.aws/aws-observability/aws-otel-collector:latest
+    Description: AWS Distro for OpenTelemetry Collector image (sidecar)
+
+Resources:
+  # ---------- IAM ----------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-task-exec-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # ADOT Collector が X-Ray にトレースを書き込み、CloudWatch にメトリクス／ログを
+        # 書き込むために必要な権限。サイドカーもタスクロールを共有する点に注意。
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: dynamodb-users-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UsersTableName}
+
+  # ---------- Logs ----------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}
+      RetentionInDays: 14
+
+  # ---------- Security Groups ----------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SG (HTTP open to the world)
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb-sg
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS service SG (only ALB can talk to it)
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-svc-sg
+
+  ServiceSgIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServiceSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  # ---------- ALB ----------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub ${ProjectName}-PublicSubnet1Id
+        - Fn::ImportValue: !Sub ${ProjectName}-PublicSubnet2Id
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-tg
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------- ECS Cluster / Task / Service ----------
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-cluster
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-task
+      # ADOT Collector サイドカー追加に伴い、最小（256/512）から一段上げた組み合わせ。
+      # 256/512 でも動作はするが、Collector の常駐分（〜50MiB）でバースト時の OOM 余地が
+      # 小さくなるため、観測性の安定を優先して 512/1024 にしている。
+      Cpu: "512"          # 0.5 vCPU
+      Memory: "1024"      # 1 GiB
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        # ----- アプリケーションコンテナ -----
+        - Name: api
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: APP_ENV
+              Value: prod
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DYNAMODB_USERS_TABLE
+              Value: !Ref UsersTableName
+            # OTLP/HTTP のサイドカー宛先。awsvpc モードなのでタスク内は localhost で通る。
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+              Value: http://localhost:4318
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            # FastAPI / botocore の自動計装側にもサービス名を渡しておく。
+            - Name: OTEL_SERVICE_NAME
+              Value: !Sub ${ProjectName}-api
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub deployment.environment=prod,service.namespace=${ProjectName}
+            # AWS X-Ray のトレース ID 互換にするためのプロパゲーター指定（保険）。
+            - Name: OTEL_PROPAGATORS
+              Value: xray
+          # サイドカー（otel-collector）が起動完了してからアプリを起動させる。
+          # こうしないと初回スパン送信で接続失敗ログが出やすい。
+          DependsOn:
+            - ContainerName: otel-collector
+              Condition: START
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+        # ----- ADOT Collector サイドカー -----
+        # ECS タスク内で OTLP を受信し、AWS X-Ray にトレースをエクスポートする。
+        # `--config=/etc/ecs/ecs-default-config.yaml` は ADOT 公式イメージに同梱されている
+        # 既定設定で、OTLP receiver (4317/4318) と awsxray exporter / awsemf exporter を
+        # 一括で有効化する。X-Ray への送信権限はタスクロールから付与する。
+        - Name: otel-collector
+          Image: !Ref AdotCollectorImage
+          Essential: true
+          Command:
+            - "--config=/etc/ecs/ecs-default-config.yaml"
+          PortMappings:
+            - ContainerPort: 4317      # OTLP/gRPC
+              Protocol: tcp
+            - ContainerPort: 4318      # OTLP/HTTP（本サンプルのアプリ側で使用）
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: otel
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub ${ProjectName}-svc
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub ${ProjectName}-PrivateSubnet1Id
+            - Fn::ImportValue: !Sub ${ProjectName}-PrivateSubnet2Id
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AlbDnsName:
+    Description: Public DNS of the ALB
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub ${ProjectName}-AlbDnsName
+  ClusterName:
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub ${ProjectName}-ClusterName
+  ServiceName:
+    Value: !GetAtt Service.Name
+    Export:
+      Name: !Sub ${ProjectName}-ServiceName
