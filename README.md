@@ -238,8 +238,9 @@ curl "http://${ALB_DNS}/configuration"
 X-Ray 上で見えるべきもの：
 
 - **トレース詳細**: ルートの `GET /configuration`（SERVER スパン）配下に、
-  `GET`（CLIENT スパン、`http.url=https://api.ipify.org/?format=json`）が 1 本
-  ぶら下がる。HTTP ステータスや接続先ホストも属性として記録されている。
+  `GET`（CLIENT スパン、`http.url=https://api.ipify.org/?format=json`）と、
+  後述の `calc_configuration`（手動スパン、約 500ms）が並んで表示される。
+  HTTP ステータスや接続先ホストも属性として記録されている。
 - **サービスマップ**: `py-apm-sample-api → api.ipify.org` のエッジが追加される。
   外部 API がレイテンシスパイク／エラーになるとこのエッジ上で可視化される。
 - **副次効果**: レスポンスの `outbound_ip` は NAT Gateway に紐付いた Elastic IP と
@@ -256,6 +257,71 @@ X-Ray 上で見えるべきもの：
 
 いずれも `setup_tracing()` 内で `XxxInstrumentor().instrument()` を 1 行追加する
 だけで計装できる。
+
+### 独自関数の手動スパン化（X-Ray サブセグメント）
+
+自動計装ではカバーされない**独自のアプリケーション関数**を X-Ray のサブセグメント
+として計測したい場合は、OpenTelemetry の `tracer.start_as_current_span()` で
+スコープを切るだけで良い。`setup_tracing()` で構築済みの `TracerProvider` を
+経由するため、追加のセットアップやエクスポーター設定は不要。
+
+サンプル実装は `app/api/configuration.py` の `calc_configuration` 関数：
+
+```python
+from opentelemetry import trace
+
+# モジュール先頭で 1 度だけ tracer を取得（__name__ を渡すと発行元が分かる）
+tracer = trace.get_tracer(__name__)
+
+def calc_configuration():
+    """ダミー処理。X-Ray 上でサブセグメントとして可視化するだけが目的。"""
+    with tracer.start_as_current_span("calc_configuration"):
+        logger.info("Call function calc_configuration.")
+        time.sleep(0.5)
+```
+
+`GET /configuration` ハンドラ内で `return` の直前に `calc_configuration()` を
+呼び出している。
+
+#### 仕組み
+
+| 観点 | 内容 |
+| --- | --- |
+| Span 名 | `tracer.start_as_current_span("calc_configuration")` の引数。X-Ray のサブセグメント名としてそのまま表示される |
+| 親スパン | `with` に入った時点で「現在アクティブなスパン」（= FastAPIInstrumentor が発行する `GET /configuration` の SERVER スパン）が自動的に親になる |
+| Span Kind | 既定の `INTERNAL`（外部呼び出しではないため） |
+| Context 伝播 | `async` ハンドラから同期関数を呼んでも OpenTelemetry の context（`contextvars` ベース）はそのまま引き継がれるため、親子関係が維持される |
+| エクスポート | 他のスパンと同じく `BatchSpanProcessor` → OTLP/HTTP → ADOT Collector → X-Ray の経路で送られる |
+| ノイズフィルタ | `_NoiseSpanFilterProcessor` の対象は ASGI 内部イベントと `/health` 成功スパンのみ。手動スパンが意図せず捨てられることはない |
+
+#### X-Ray 上で見えるもの
+
+`GET /configuration` のトレース詳細を開くと、SERVER スパン配下に以下が並ぶ：
+
+```
+GET /configuration                          (SERVER, ~500ms+)
+├─ GET https://api.ipify.org/?format=json   (CLIENT, httpx 自動計装)
+└─ calc_configuration                       (INTERNAL, 手動スパン, ~500ms)
+```
+
+例外を投げた場合は `with` ブロックを抜ける際に span status が自動で `ERROR` になり、
+X-Ray のサブセグメントが赤くハイライトされる（明示的な `record_exception()` 呼び出しは
+不要）。
+
+#### 属性を足したい場合
+
+業務ロジックの入出力をスパンに乗せたい場合は `set_attribute` で属性を足せる：
+
+```python
+with tracer.start_as_current_span("calc_configuration") as span:
+    span.set_attribute("config.input_size", len(payload))
+    result = do_work(payload)
+    span.set_attribute("config.output_size", len(result))
+```
+
+X-Ray のサブセグメント詳細パネルの "Annotations / Metadata" に表示される
+（OTLP → X-Ray 変換時のキー長やインデックス可否ルールがあるため、検索対象にしたい
+キーは英数アンダースコアの短い名前にしておくと安全）。
 
 ### 動作確認
 
