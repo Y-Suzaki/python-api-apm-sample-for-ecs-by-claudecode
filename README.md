@@ -145,7 +145,7 @@ AWS Application Signals（X-Ray トレース詳細 + CloudWatch メトリクス�
    用の TracerProvider / MeterProvider を構築する。未設定時（ローカル開発）は最小限の
    TracerProvider を自前で組み、外部接続を試みない。
 2. distro による FastAPI/ASGI 自動計装は `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=fastapi,asgi`
-   で無効化し、`FastAPIInstrumentor.instrument_app(app, excluded_urls=r"^/health$")` で
+   で無効化し、`FastAPIInstrumentor.instrument_app(app, excluded_urls=r"/health$")` で
    手動計装する。これにより `/health` を確実に計装対象（= スパン生成 + メトリクス集計）から外す。
 3. `BotocoreInstrumentor().instrument()` と `HTTPXClientInstrumentor().instrument()` で
    DynamoDB・外部 HTTP を自動計装する。
