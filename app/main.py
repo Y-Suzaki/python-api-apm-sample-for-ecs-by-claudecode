@@ -30,6 +30,6 @@ def health() -> dict[str, str]:
 app.include_router(users_router)
 app.include_router(configuration_router)
 
-# OpenTelemetry → ADOT Collector（サイドカー）→ AWS X-Ray の計装は
+# OpenTelemetry → CloudWatch Agent（サイドカー）→ AWS Application Signals の計装は
 # ルーター登録後にまとめて行う（FastAPIInstrumentor が既存ルートを拾うため）。
 setup_tracing(app, service_name=settings.app_name, environment=settings.app_env)
