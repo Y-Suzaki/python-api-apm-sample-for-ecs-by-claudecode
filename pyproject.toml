@@ -13,7 +13,7 @@ dependencies = [
     "email-validator>=2.2.0",
     # 外部 HTTP API 呼び出し用（/configuration エンドポイント）。
     "httpx>=0.27.0",
-    # --- OpenTelemetry (ADOT 経由で AWS X-Ray に送信) ---
+    # --- OpenTelemetry (CloudWatch Agent サイドカー → AWS Application Signals) ---
     "opentelemetry-api>=1.27.0",
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp-proto-http>=1.27.0",
@@ -22,6 +22,11 @@ dependencies = [
     "opentelemetry-instrumentation-httpx>=0.48b0",
     "opentelemetry-sdk-extension-aws>=2.0.2",
     "opentelemetry-propagator-aws-xray>=1.0.1",
+    # AWS Application Signals 用の Distro。TracerProvider / MeterProvider に
+    # AWS 固有の SpanProcessor / MetricExporter を装着する役割を持つ。
+    # opentelemetry-instrument 経由起動時に自動発火する Configurator を、
+    # app/core/telemetry.py から明示的に呼び出して使う。
+    "aws-opentelemetry-distro>=0.10.0",
 ]
 
 [dependency-groups]

@@ -74,12 +74,12 @@ export AWS_SECRET_ACCESS_KEY=...
 
 完了後、`scripts/deploy-service.sh` の出力にある `http://<alb-dns>/docs` から Swagger UI を確認できる。
 
-## トレーシング（AWS Distro for OpenTelemetry → X-Ray）
+## トレーシング（AWS Application Signals）
 
 ALB 経由のリクエストを受けた FastAPI から DynamoDB 呼び出しまでを **1 本のトレース** として
-AWS X-Ray のサービスマップ／トレース詳細で可視化できるようにしている。
-コードに専用 SDK（旧 X-Ray SDK 等）を持ち込まず、**OpenTelemetry の自動計装**＋
-**ADOT Collector サイドカー**の 2 段構成で実現しているのがポイント。
+AWS Application Signals（X-Ray トレース詳細 + CloudWatch メトリクス）で可視化できるようにしている。
+コードに専用 SDK（旧 X-Ray SDK 等）を持ち込まず、**OpenTelemetry 自動計装**＋
+**CloudWatch Agent サイドカー（Application Signals モード）** の 2 段構成で実現しているのがポイント。
 
 ### データフロー
 
@@ -90,21 +90,21 @@ AWS X-Ray のサービスマップ／トレース詳細で可視化できるよ�
 [ALB] ─── X-Amzn-Trace-Id 採番／伝播
     │
     ▼
-┌─ ECS Fargate Task ──────────────────────────────────────┐
-│   ┌──────────────────┐  OTLP/HTTP  ┌──────────────────┐ │
-│   │ api (FastAPI)    │ ──────────▶ │ otel-collector   │ │
-│   │ 自動計装:         │   :4318      │ (ADOT sidecar)   │ │
-│   │  • FastAPI       │              │                  │ │
-│   │  • botocore      │              └────────┬─────────┘ │
-│   │  • httpx         │                       │ awsxray   │
-│   └──┬─────────┬─────┘                       │ exporter  │
-└──────┼─────────┼─────────────────────────────┼───────────┘
-       │ AWS API │ HTTPS                       │
-       │ (boto3) │ (httpx)                     ▼
-       ▼         ▼                       [AWS X-Ray]
-   [DynamoDB]  [NAT GW] ──▶ Internet ──▶ [外部 API]
-   (Gateway                              (例: api.ipify.org)
-    VPCE)
+┌─ ECS Fargate Task ────────────────────────────────────────────┐
+│   ┌──────────────────┐  OTLP/HTTP  ┌────────────────────────┐ │
+│   │ api (FastAPI)    │ ──────────▶ │ otel-collector         │ │
+│   │ 自動計装:         │   :4316      │ (CloudWatch Agent      │ │
+│   │  • FastAPI       │              │  Application Signals)  │ │
+│   │  • botocore      │              └──────────┬─────────────┘ │
+│   │  • httpx         │                         │               │
+│   └──┬─────────┬─────┘                         │               │
+└──────┼─────────┼───────────────────────────────┼───────────────┘
+       │ AWS API │ HTTPS                          │
+       │ (boto3) │ (httpx)              ┌─────────┴──────────┐
+       ▼         ▼                      ▼                    ▼
+   [DynamoDB]  [NAT GW] ──▶ Internet  [AWS X-Ray]   [CloudWatch Metrics]
+   (Gateway               ──▶ [外部 API]  (トレース詳細)  (RED メトリクス)
+    VPCE)                    (例: api.ipify.org)
 ```
 
 ### 構成要素
@@ -116,54 +116,77 @@ AWS X-Ray のサービスマップ／トレース詳細で可視化できるよ�
 | アプリ計装 | `opentelemetry-instrumentation-fastapi` | 受信リクエストを HTTP サーバースパンに変換 |
 | AWS SDK 計装 | `opentelemetry-instrumentation-botocore` | boto3 が呼ぶ DynamoDB API を AWS スパン（`AWS::DynamoDB::Table` ノード）に変換 |
 | 外部 HTTP 計装 | `opentelemetry-instrumentation-httpx` | `httpx` 経由の外部 API 呼び出しを HTTP クライアントスパンに変換（`/configuration` で確認可） |
-| 送信 | OTLP/HTTP（`opentelemetry-exporter-otlp-proto-http`） | `localhost:4318` のサイドカー宛にバッチ送信 |
-| 集約／X-Ray 送信 | ADOT Collector（`public.ecr.aws/aws-observability/aws-otel-collector`）サイドカー | OTLP を受け取り `awsxray` exporter で X-Ray API に PUT |
+| 送信 | OTLP/HTTP（`opentelemetry-exporter-otlp-proto-http`） | `localhost:4316/v1/traces`（CloudWatch Agent Application Signals ポート）にバッチ送信 |
+| 集約／Application Signals 送信 | CloudWatch Agent（`public.ecr.aws/cloudwatch-agent/cloudwatch-agent`）サイドカー | OTLP を受け取り X-Ray にトレースを PUT、CloudWatch に RED メトリクスを書き込む |
 
 ### Fargate サイドカー構成（`cloudformation/04-ecs-alb.yaml`）
 
-- 同一タスク内に `api` コンテナと `otel-collector` コンテナを定義。`awsvpc` モードのため
-  両者は `localhost` で疎通する（`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`）。
-- ADOT 公式イメージ同梱の既定設定 `/etc/ecs/ecs-default-config.yaml` を `--config` で指定。
-  これだけで OTLP receiver (`4317` / `4318`) と `awsxray` / `awsemf` exporter が有効になる。
+- 同一タスク内に `api` コンテナと `otel-collector`（CloudWatch Agent）コンテナを定義。
+  `awsvpc` モードのため両者は `localhost` で疎通する
+  （`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4316/v1/traces`）。
+- CloudWatch Agent は `CW_CONFIG_CONTENT` 環境変数に JSON で設定を流し込む。
+  `traces.traces_collected.application_signals` と `logs.metrics_collected.application_signals`
+  を有効化するだけで OTLP receiver（ポート 4316）と X-Ray サンプリングプロキシ（UDP/2000）
+  が起動する。外部設定ファイルは不要。
 - `api` には `dependsOn: [{otel-collector, START}]` を付け、初回スパン送信時の接続失敗を回避。
 - タスクロールに以下のマネージドポリシーを付与し、サイドカーから X-Ray / CloudWatch に
   書き込みできるようにしている。
     - `AWSXRayDaemonWriteAccess`（`xray:PutTraceSegments`, `xray:PutTelemetryRecords`）
-    - `CloudWatchAgentServerPolicy`（メトリクス／ログ送信用）
+    - `CloudWatchAgentServerPolicy`（メトリクス／ログ送信 + Application Signals API 呼び出し）
 - サイドカー追加に伴い、タスクサイズは最小の `256/512` から `512/1024` に一段引き上げた。
-  Collector 自体の常駐メモリ（〜50MiB）と DynamoDB スパンのバッファを安定して扱うため。
+  Agent 自体の常駐メモリ（〜50MiB）と DynamoDB スパンのバッファを安定して扱うため。
 
 ### アプリ側コード（`app/core/telemetry.py`）
 
-`setup_tracing()` を `app/main.py` から 1 回だけ呼ぶ。やっていることは次の 5 ステップ：
+`setup_tracing()` を `app/main.py` から 1 回だけ呼ぶ。やっていることは次の 4 ステップ：
 
-1. グローバルプロパゲーターを `AwsXRayPropagator` に差し替え（ALB の `X-Amzn-Trace-Id` を解釈）
-2. `service.name` / `deployment.environment` を `Resource` として設定
-3. `id_generator=AwsXRayIdGenerator()` を持つ `TracerProvider` を構築
-4. `OTEL_EXPORTER_OTLP_ENDPOINT` が設定されていれば OTLP/HTTP の `BatchSpanProcessor` を装着
-   （ローカル開発時は未設定にしておけば送信処理ごと無効化される）
-5. 自動計装を 3 種有効化
-   - `FastAPIInstrumentor.instrument_app(app)` … 受信リクエスト
-   - `BotocoreInstrumentor().instrument()` … boto3 が呼ぶ AWS API（DynamoDB 等）
-   - `HTTPXClientInstrumentor().instrument()` … `httpx` 経由の外部 HTTP 呼び出し
+1. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` が設定されていれば `aws-opentelemetry-distro` の
+   `AwsOpenTelemetryDistro` + `AwsOpenTelemetryConfigurator` を呼び出し、Application Signals
+   用の TracerProvider / MeterProvider を構築する。未設定時（ローカル開発）は最小限の
+   TracerProvider を自前で組み、外部接続を試みない。
+2. distro による FastAPI/ASGI 自動計装は `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=fastapi,asgi`
+   で無効化し、`FastAPIInstrumentor.instrument_app(app, excluded_urls=r"^/health$")` で
+   手動計装する。これにより `/health` を確実に計装対象（= スパン生成 + メトリクス集計）から外す。
+3. `BotocoreInstrumentor().instrument()` と `HTTPXClientInstrumentor().instrument()` で
+   DynamoDB・外部 HTTP を自動計装する。
+4. distro が登録した `BatchSpanProcessor` の `span_exporter` を `_NoiseFilteringSpanExporter`
+   でラップし、ASGI 内部イベントスパンをエクスポート直前に drop する。
 
 ECS 側で渡している環境変数（タスク定義より）：
 
 | 変数 | 値 | 効果 |
 | --- | --- | --- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | サイドカー Collector 宛 OTLP/HTTP |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://localhost:4316/v1/traces` | CloudWatch Agent Application Signals ポート宛 OTLP/HTTP |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | gRPC ではなく HTTP/Protobuf |
-| `OTEL_SERVICE_NAME` | `py-apm-sample-api` | X-Ray サービスマップのノード名 |
-| `OTEL_PROPAGATORS` | `xray` | コード側設定の保険として明示 |
+| `OTEL_AWS_APPLICATION_SIGNALS_ENABLED` | `true` | Application Signals のメトリクス派生を有効化 |
+| `OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT` | `http://localhost:4316/v1/metrics` | メトリクス送信先 |
+| `OTEL_METRICS_EXPORTER` | `none` | distro 既定の OTLP metrics exporter を無効化（Application Signals 経由で送るため） |
+| `OTEL_LOGS_EXPORTER` | `none` | 同上（logs） |
+| `OTEL_TRACES_SAMPLER` | `xray` | X-Ray セントラルサンプリングを使用 |
+| `OTEL_TRACES_SAMPLER_ARG` | `endpoint=http://localhost:2000` | CW Agent が UDP/2000 で X-Ray と橋渡し |
+| `OTEL_PYTHON_DISTRO` | `aws_distro` | aws-opentelemetry-distro の Configurator を有効化 |
+| `OTEL_PYTHON_CONFIGURATOR` | `aws_configurator` | 同上 |
+| `OTEL_SERVICE_NAME` | `py-apm-sample-api` | Application Signals サービスマップのノード名 |
+| `OTEL_PROPAGATORS` | `tracecontext,baggage,b3,xray` | Application Signals 推奨の伝播形式 |
 | `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=prod,service.namespace=...` | サービスマップのフィルタタグ |
 
 ### ノイズスパンの間引き
 
-X-Ray のトレース一覧／トレース詳細を読みやすく保つため、
-`app/core/telemetry.py` の `_NoiseSpanFilterProcessor` で `BatchSpanProcessor`
-を委譲ラップし、エクスポート直前に 2 種類のノイズを捨てている。
+X-Ray トレース詳細と Application Signals メトリクスを読みやすく保つため、
+2 種類のアプローチでノイズを排除している。
 
-#### 1. ASGI 内部イベントスパン（常に捨てる）
+#### 1. `/health` ヘルスチェック（計装自体をスキップ）
+
+`FastAPIInstrumentor.instrument_app(app, excluded_urls=r"/health$")` により、
+`/health` への受信リクエストはスパンが生成されない。スパンが生成されないため
+Application Signals のメトリクス（リクエスト数・レイテンシ・エラー率）にも
+ヘルスチェックが混入しない。
+
+distro が FastAPI/ASGI を先に自動計装してしまうと `excluded_urls` が無効になるため、
+distro 起動前に `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=fastapi,asgi` を設定し、
+distro による自動計装をスキップしている。
+
+#### 2. ASGI 内部イベントスパン（エクスポート直前に drop）
 
 `FastAPIInstrumentor` 配下の `opentelemetry-instrumentation-asgi` は、
 1 リクエストにつき以下のサブスパンを自動生成する。
@@ -174,28 +197,11 @@ X-Ray のトレース一覧／トレース詳細を読みやすく保つため�
 | `... http send` | `http.response.start` | ステータスコード＋ヘッダ送信 |
 | `... http send` | `http.response.body` | ボディチャンク送信 |
 
-これらは TTFB / ボディフラッシュの厳密測定に有用だが、X-Ray のサブセグメント
-として冗長に並んで可読性を落とす。`asgi.event.type` 属性を持つスパンは
-無条件で export 対象から外している。
-
-#### 2. ヘルスチェックの成功スパン
-
-ALB のターゲットヘルスチェックは秒〜数十秒間隔で `/health` を叩くため、
-**`/health` への成功スパンのみ** 捨てる。
-
-| 条件 | X-Ray に出るか |
-| --- | --- |
-| `GET /health` が 200 で返る | ✗（捨てる） |
-| `GET /health` が 5xx を返す | ✓（残す） |
-| `GET /health` 内で例外が上がり span status が ERROR になる | ✓（残す） |
-| その他のパス（`/users` など） | ✓（常に残す） |
-
-`Sampler` ではなく `SpanProcessor` 段で判定しているのは、サンプラーがスパン
-**開始時**に判定するため「成功なら捨てる」という後追い判断ができないため。
-
-対象パスを増やしたい場合は
-`setup_tracing(app, ..., drop_successful_paths=("/health", "/ping"))` のように
-呼び出し側で渡せる。
+これらは X-Ray のサブセグメントとして冗長に並ぶため、
+`_NoiseFilteringSpanExporter` が `asgi.event.type` 属性を持つスパンをエクスポート
+直前に drop する。distro が登録した `BatchSpanProcessor` の `span_exporter` を
+このラッパーで差し替えており、`BatchSpanProcessor` 自体は触らないため
+X-Ray リモートサンプラー連携と競合しない。
 
 ### 外部 HTTP 呼び出しの計装（httpx）
 
@@ -291,8 +297,8 @@ def calc_configuration():
 | 親スパン | `with` に入った時点で「現在アクティブなスパン」（= FastAPIInstrumentor が発行する `GET /configuration` の SERVER スパン）が自動的に親になる |
 | Span Kind | 既定の `INTERNAL`（外部呼び出しではないため） |
 | Context 伝播 | `async` ハンドラから同期関数を呼んでも OpenTelemetry の context（`contextvars` ベース）はそのまま引き継がれるため、親子関係が維持される |
-| エクスポート | 他のスパンと同じく `BatchSpanProcessor` → OTLP/HTTP → ADOT Collector → X-Ray の経路で送られる |
-| ノイズフィルタ | `_NoiseSpanFilterProcessor` の対象は ASGI 内部イベントと `/health` 成功スパンのみ。手動スパンが意図せず捨てられることはない |
+| エクスポート | 他のスパンと同じく `BatchSpanProcessor` → OTLP/HTTP → CloudWatch Agent → Application Signals の経路で送られる |
+| ノイズフィルタ | `_NoiseFilteringSpanExporter` の drop 対象は `asgi.event.type` 属性を持つ ASGI 内部イベントのみ。手動スパンが意図せず捨てられることはない |
 
 #### X-Ray 上で見えるもの
 
@@ -344,12 +350,14 @@ curl "http://${ALB_DNS}/users/alice@example.com"
 
 ### 既知のはまりどころ
 
-- ECR Public からの `aws-otel-collector` イメージ pull は、Private サブネットからは
+- ECR Public からの `cloudwatch-agent` イメージ pull は、Private サブネットからは
   NAT Gateway 経由で外部に出る必要がある。本サンプルは NAT Gateway を構築済みなので OK。
-- アプリコンテナが Collector より先に立ち上がると初回エクスポートが失敗するため、
+- アプリコンテナが CloudWatch Agent より先に立ち上がると初回エクスポートが失敗するため、
   `dependsOn: START` を必ず指定する（再起動時のレース対策）。
-- ローカル実行（`uv run uvicorn ...`）では `OTEL_EXPORTER_OTLP_ENDPOINT` を未設定にしておけば
-  Collector への接続を試みず、自動計装のオーバーヘッドだけが乗る状態で開発できる。
+- ローカル実行（`uv run uvicorn ...`）では `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` を未設定にしておけば
+  Agent への接続を試みず、自動計装のオーバーヘッドだけが乗る状態で開発できる。
+- `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=fastapi,asgi` は distro を呼ぶ前にコード内で
+  `os.environ.setdefault` で設定している。ECS タスク定義から同名の環境変数を渡せば上書きできる。
 - httpx 計装は `HTTPXClientInstrumentor().instrument()` を呼んだ時点でグローバルに
   パッチが当たる。既に生成済みの `Client` インスタンスにも反映されるが、計装前から
   保持していた接続のリクエストではコンテキストが伝播しないので、`setup_tracing()` は
