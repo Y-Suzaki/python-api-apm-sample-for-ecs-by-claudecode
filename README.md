@@ -1,6 +1,7 @@
 # python-api-apm-sample-for-ecs-by-claudecode
 
-FastAPI で実装したユーザー管理 API を、AWS ALB + ECS Fargate + DynamoDB 上で動かすサンプル。
+FastAPI (Python) で実装したユーザー管理 API を、AWS ALB + ECS Fargate + DynamoDB 上で動かすサンプル。  
+Open Telemetryを活用し、Application SignalsとX-Rayと連携する。
 
 ## 構成図（論理）
 
