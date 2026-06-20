@@ -12,12 +12,20 @@ NAT Gateway に紐付いている Elastic IP になる（ALB→ECS→NAT→Inter
 from __future__ import annotations
 
 import httpx
+import logging
+import time
 from fastapi import APIRouter, HTTPException, status
+from opentelemetry import trace
 from pydantic import BaseModel, Field
 
 from app.api.deps import SettingsDep
 
 router = APIRouter(tags=["configuration"])
+logger = logging.getLogger(__name__)
+# 自動計装ではカバーされない独自処理（calc_configuration）を手動でスパン化する
+# ための tracer。``__name__`` を渡しておくと X-Ray 上で発行元モジュールが分かる。
+tracer = trace.get_tracer(__name__)
+
 
 # 無料・無認証・JSON で公開グローバル IP を返す軽量サービス。
 _IPIFY_URL = "https://api.ipify.org"
@@ -34,6 +42,19 @@ class Configuration(BaseModel):
         ...,
         description="ipify から取得したグローバル送信元 IP（= NAT Gateway の EIP）",
     )
+
+
+def calc_configuration():
+    """ ダミー処理を行う関数。トレーシング計測用のため実装内容に意味はない。
+
+    呼び出しを X-Ray のサブセグメントとして可視化するため、関数本体を
+    ``tracer.start_as_current_span`` で包んで手動スパンを 1 本発行する。
+    現在のリクエストスパン（FastAPIInstrumentor が生成する SERVER スパン）が
+    親になるので、X-Ray のトレース詳細では ``/configuration`` の子として表示される。
+    """
+    with tracer.start_as_current_span("calc_configuration"):
+        logger.info("Call function calc_configuration.")
+        time.sleep(0.5)
 
 
 @router.get(
@@ -56,6 +77,11 @@ async def get_configuration(settings: SettingsDep) -> Configuration:
         ) from exc
 
     body = resp.json()
+
+    # ipify 応答取得後、独自処理（手動スパン化済み）を 1 回挟む。
+    # X-Ray サービスマップ／トレース詳細で外部 HTTP スパンと並んで表示される想定。
+    calc_configuration()
+
     return Configuration(
         service_name=settings.app_name,
         environment=settings.app_env,

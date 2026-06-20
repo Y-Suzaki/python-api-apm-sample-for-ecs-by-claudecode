@@ -21,10 +21,11 @@ Parameters:
     Default: users
   AdotCollectorImage:
     Type: String
-    # ADOT (AWS Distro for OpenTelemetry) Collector の公式 ECR Public イメージ。
+    # CloudWatch Agent の公式 ECR Public イメージ。Application Signals
+    # （OTLP 受信 + X-Ray / CloudWatch Metrics 送信）を担うサイドカーとして使う。
     # 本番運用時はタグを固定するのが望ましい。
-    Default: public.ecr.aws/aws-observability/aws-otel-collector:latest
-    Description: AWS Distro for OpenTelemetry Collector image (sidecar)
+    Default: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+    Description: CloudWatch Agent image used as Application Signals sidecar
 
 Resources:
   # ---------- IAM ----------
@@ -54,8 +55,9 @@ Resources:
               Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        # ADOT Collector が X-Ray にトレースを書き込み、CloudWatch にメトリクス／ログを
-        # 書き込むために必要な権限。サイドカーもタスクロールを共有する点に注意。
+        # CloudWatch Agent サイドカーが X-Ray にトレース、CloudWatch にメトリクス／ログを
+        # 書き込み、かつ Application Signals の API を呼ぶために必要な権限。
+        # サイドカーもタスクロールを共有する点に注意。
         - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
         - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
@@ -196,19 +198,40 @@ Resources:
               Value: !Ref AWS::Region
             - Name: DYNAMODB_USERS_TABLE
               Value: !Ref UsersTableName
-            # OTLP/HTTP のサイドカー宛先。awsvpc モードなのでタスク内は localhost で通る。
-            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
-              Value: http://localhost:4318
+            # CloudWatch Agent サイドカーの Application Signals OTLP/HTTP 受信ポートは 4316。
+            # awsvpc モードなのでタスク内は localhost で通る。
             - Name: OTEL_EXPORTER_OTLP_PROTOCOL
               Value: http/protobuf
+            - Name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              Value: http://localhost:4316/v1/traces
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_ENABLED
+              Value: "true"
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT
+              Value: http://localhost:4316/v1/metrics
+            # Application Signals 経由でメトリクスを送るため、OTLP の metrics/logs は無効化。
+            - Name: OTEL_METRICS_EXPORTER
+              Value: none
+            - Name: OTEL_LOGS_EXPORTER
+              Value: none
+            # X-Ray セントラルサンプリング（CW Agent が UDP/2000 で X-Ray と橋渡しする）。
+            - Name: OTEL_TRACES_SAMPLER
+              Value: xray
+            - Name: OTEL_TRACES_SAMPLER_ARG
+              Value: endpoint=http://localhost:2000
+            # AWS Distro for OpenTelemetry Python の Configurator を有効化する
+            # （aws-opentelemetry-distro が導入されていれば自動で効く。未導入時は無視）。
+            - Name: OTEL_PYTHON_DISTRO
+              Value: aws_distro
+            - Name: OTEL_PYTHON_CONFIGURATOR
+              Value: aws_configurator
             # FastAPI / botocore の自動計装側にもサービス名を渡しておく。
             - Name: OTEL_SERVICE_NAME
               Value: !Sub ${ProjectName}-api
             - Name: OTEL_RESOURCE_ATTRIBUTES
               Value: !Sub deployment.environment=prod,service.namespace=${ProjectName}
-            # AWS X-Ray のトレース ID 互換にするためのプロパゲーター指定（保険）。
+            # AWS X-Ray のトレース ID 互換にするためのプロパゲーター指定（Application Signals 推奨）。
             - Name: OTEL_PROPAGATORS
-              Value: xray
+              Value: tracecontext,baggage,b3,xray
           # サイドカー（otel-collector）が起動完了してからアプリを起動させる。
           # こうしないと初回スパン送信で接続失敗ログが出やすい。
           DependsOn:
@@ -221,27 +244,39 @@ Resources:
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: api
 
-        # ----- ADOT Collector サイドカー -----
-        # ECS タスク内で OTLP を受信し、AWS X-Ray にトレースをエクスポートする。
-        # `--config=/etc/ecs/ecs-default-config.yaml` は ADOT 公式イメージに同梱されている
-        # 既定設定で、OTLP receiver (4317/4318) と awsxray exporter / awsemf exporter を
-        # 一括で有効化する。X-Ray への送信権限はタスクロールから付与する。
+        # ----- CloudWatch Agent サイドカー（Application Signals 用） -----
+        # ECS タスク内で OTLP を 4315/4316 で受信し、AWS Application Signals
+        # （X-Ray トレース + CloudWatch メトリクス）にエクスポートする。
+        # `application_signals` を有効化すると OTLP receiver と X-Ray サンプリング
+        # (UDP/2000) も自動で起動する。設定は CW_CONFIG_CONTENT に JSON を流し込む。
+        # X-Ray / CloudWatch への送信権限はタスクロールから付与する。
         - Name: otel-collector
           Image: !Ref AdotCollectorImage
           Essential: true
-          Command:
-            - "--config=/etc/ecs/ecs-default-config.yaml"
           PortMappings:
-            - ContainerPort: 4317      # OTLP/gRPC
+            - ContainerPort: 4316      # OTLP/HTTP（本サンプルのアプリ側で使用）
               Protocol: tcp
-            - ContainerPort: 4318      # OTLP/HTTP（本サンプルのアプリ側で使用）
-              Protocol: tcp
+          Environment:
+            - Name: CW_CONFIG_CONTENT
+              Value: |
+                {
+                  "traces": {
+                    "traces_collected": {
+                      "application_signals": {}
+                    }
+                  },
+                  "logs": {
+                    "metrics_collected": {
+                      "application_signals": {}
+                    }
+                  }
+                }
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref LogGroup
               awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: otel
+              awslogs-stream-prefix: ecs-cwagent
 
   Service:
     Type: AWS::ECS::Service
